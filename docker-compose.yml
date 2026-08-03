@@ -1,0 +1,178 @@
+name: appmonetizar
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: appmonetizar-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appmonetizar}
+      POSTGRES_USER: ${POSTGRES_USER:-appmonetizar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appmonetizar} -d ${POSTGRES_DB:-appmonetizar}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [appmonetizar]
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: appmonetizar-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-appmonetizar}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD is required}
+    ports:
+      - "${RABBITMQ_PORT:-5673}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15673}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [appmonetizar]
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: appmonetizar-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-appmonetizar}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    ports:
+      - "${MINIO_API_PORT:-9002}:9000"
+      - "${MINIO_CONSOLE_PORT:-9003}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [appmonetizar]
+
+  n8n:
+    image: n8nio/n8n:1.102.4
+    container_name: appmonetizar-n8n
+    restart: unless-stopped
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-appmonetizar}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-appmonetizar}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY is required}
+      N8N_USER_MANAGEMENT_JWT_SECRET: ${N8N_USER_MANAGEMENT_JWT_SECRET:?N8N_USER_MANAGEMENT_JWT_SECRET is required}
+      GENERIC_TIMEZONE: America/Guayaquil
+      TZ: America/Guayaquil
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_SECURE_COOKIE: "false"
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5679/}
+    ports:
+      - "${N8N_PORT:-5679}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/data/workflows
+      - ./shared:/data/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [appmonetizar]
+
+  api:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: src/AppMonetizar.Api/Dockerfile
+    container_name: appmonetizar-api
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__PostgreSql: Host=postgres;Port=5432;Database=${POSTGRES_DB:-appmonetizar};Username=${POSTGRES_USER:-appmonetizar};Password=${POSTGRES_PASSWORD}
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_USER:-appmonetizar}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD}
+      Storage__Endpoint: http://minio:9000
+      Storage__AccessKey: ${MINIO_ROOT_USER:-appmonetizar}
+      Storage__SecretKey: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${API_PORT:-8088}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [appmonetizar]
+
+  worker:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: src/AppMonetizar.Worker/Dockerfile
+    container_name: appmonetizar-worker
+    restart: unless-stopped
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      ConnectionStrings__PostgreSql: Host=postgres;Port=5432;Database=${POSTGRES_DB:-appmonetizar};Username=${POSTGRES_USER:-appmonetizar};Password=${POSTGRES_PASSWORD}
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_USER:-appmonetizar}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD}
+      Storage__Endpoint: http://minio:9000
+      Storage__AccessKey: ${MINIO_ROOT_USER:-appmonetizar}
+      Storage__SecretKey: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [appmonetizar]
+
+  frontend:
+    profiles: [app]
+    build:
+      context: frontend/app-monetizar-web
+      dockerfile: Dockerfile
+    container_name: appmonetizar-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-4208}:80"
+    depends_on: [api]
+    networks: [appmonetizar]
+
+  ollama:
+    profiles: [local-ai]
+    image: ollama/ollama:0.9.6
+    container_name: appmonetizar-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11435}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks: [appmonetizar]
+
+networks:
+  appmonetizar:
+    name: appmonetizar-network
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  minio_data:
+  n8n_data:
+  ollama_data:
